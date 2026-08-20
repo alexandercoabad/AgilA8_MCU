@@ -15,26 +15,13 @@ AgilA8 is a compact 8-bit microcontroller built around A8, a custom
 16-instruction CPU (see `docs/ISA.md`), with memory-mapped GPIO, a 16-bit
 timer, and PWM generation.
 
-Instruction memory (all of it) and most of data memory live off-chip
-on the Tiny Tapeout QSPI Pmod. Program code is fetched from external
-SPI flash (CS0) using a standard `03h` Read Data command; the bulk of
-data memory (0x80-0xEF) lives on one of the Pmod's two PSRAM chips
-(RAM A / CS1) using standard `02h`/`03h` Write/Read commands. Only
-plain, single-line SPI commands are used for flash/PSRAM - deliberately
-not flash's continuous-read mode or PSRAM's QPI mode, both of which need
-a mode-byte/setup sequence that's easy to get subtly wrong without
-hardware to verify against.
-
-The low 128 bytes of DMEM (0x00-0x7F) are on-chip instead, in `ram32`,
-making the QSPI Pmod optional for software that stays within that
-range - **flash is still required for IMEM regardless**, so the Pmod
-as a whole is not optional, only the DMEM side of it. `ram32` is a
+ `ram32` is a
 plain 128-byte flip-flop array (1,024 flip-flops), not a dense macro -
 this project originally moved DMEM off-chip specifically because a 1x2
 tile budget doesn't fit that (even Tiny Tapeout's own dense RAM32 hard
 macro, the same 128 bytes laid out efficiently, needs 3x2 tiles on its
 own; a plain flip-flop array is larger still). **This project now
-targets 3x2 tiles** (see `info.yaml`'s `tiles` field) specifically to
+targets 6x2 tiles** (see `info.yaml`'s `tiles` field) specifically to
 accommodate `ram32` at this size - that's a deliberate area/cost
 tradeoff made in exchange for on-chip DMEM and an optional-for-data
 Pmod, not an oversight. Still worth confirming against the actual

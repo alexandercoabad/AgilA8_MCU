@@ -4,7 +4,10 @@
 Agila is Tagalog for "eagle" - specifically evoking the Philippine Eagle (Haribon), the country's national bird. AgilA8 pairs that with A8, the name of the CPU core at the center of the design: Agil + A8 = AgilA8, the two overlapping on a shared capital A.
 
 ## Layout 
-![Uploading Screenshot 2026-08-21 at 6.26.22 AM.png…]()
+<img width="1304" height="298" alt="Screenshot 2026-08-21 at 6 26 22 AM" src="https://github.com/user-attachments/assets/64494301-7a5b-4dfb-a26a-3cd5fb614b17" />
+
+
+
 
 3D Viewer: https://gds-viewer.tinytapeout.com/?model=https://alexandercoabad.github.io/AgilA8_mcu/tinytapeout.oas&pdk=sky130A
 

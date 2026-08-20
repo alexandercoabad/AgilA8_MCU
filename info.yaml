@@ -1,56 +1,72 @@
 # Tiny Tapeout project information
 project:
-  title:        ""      # Project title
-  author:       ""      # Your name
-  discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  ""      # One line description of what your project does
+  title:        "AgilA8 - an 8-bit Microcontroller"      # Project title
+  author:       "Alexander Co Abad"      # Your name
+  discord:      "alexandercoabad_25756"      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
+  description:  "AgilA8 is a compact 8-bit microcontroller featuring a custom
+      16-instruction CPU, memory-mapped GPIO, a 16-bit timer, and PWM
+      generation. The low 128 bytes of DMEM and the low 128 bytes of IMEM
+      (a fixed boot ROM plus a runtime-loadable bootloader RAM) are
+      on-chip; everything else - the rest of DMEM, and IMEM above 0x80 -
+      uses external QSPI flash/PSRAM over the Tiny Tapeout QSPI Pmod,
+      making the Pmod fully optional as long as the loaded program stays
+      within on-chip memory."      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
-  clock_hz:     0       # Clock frequency in Hz (or 0 if not applicable)
+  clock_hz:     50000000       # Clock frequency in Hz (or 0 if not applicable)
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
-  tiles: "1x1"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
+  tiles: "3x2"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
 
   # Your top module name must start with "tt_um_". Make it unique by including your github username:
-  top_module:  "tt_um_example"
+  top_module:  "tt_um_agila8"
 
   # List your project's source files here.
   # Source files must be in ./src and you must list each source file separately, one per line.
   # Don't forget to also update `PROJECT_SOURCES` in test/Makefile.
   source_files:
-    - "project.v"
+    - "tt_um_agila8.v"
+    - "qspi_shared_engine.v"
+    - "a8_core.v"
+    - "a8_alu.v"
+    - "a8_regfile.v"
+    - "a8_peripherals.v"
+    - "spi_ctrl.v"
+    - "ram32.v"
+    - "boot_rom.v"
+    - "iram.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
   # Inputs
-  ui[0]: ""
-  ui[1]: ""
-  ui[2]: ""
-  ui[3]: ""
-  ui[4]: ""
-  ui[5]: ""
-  ui[6]: ""
-  ui[7]: ""
+  ui[0]: "gpio_in[0]"
+  ui[1]: "gpio_in[1]"
+  ui[2]: "gpio_in[2]"
+  ui[3]: "gpio_in[3]"
+  ui[4]: "gpio_in[4]"
+  ui[5]: "gpio_in[5]"
+  ui[6]: "gpio_in[6]"
+  ui[7]: "gpio_in[7]"
 
   # Outputs
-  uo[0]: ""
-  uo[1]: ""
-  uo[2]: ""
-  uo[3]: ""
-  uo[4]: ""
-  uo[5]: ""
-  uo[6]: ""
-  uo[7]: ""
+  uo[0]: "gpio_out[0]"
+  uo[1]: "gpio_out[1]"
+  uo[2]: "gpio_out[2]"
+  uo[3]: "gpio_out[3]"
+  uo[4]: "gpio_out[4]"
+  uo[5]: "gpio_out[5]"
+  uo[6]: "gpio_out[6]"
+  uo[7]: "PWM output"
 
   # Bidirectional pins
-  uio[0]: ""
-  uio[1]: ""
-  uio[2]: ""
-  uio[3]: ""
-  uio[4]: ""
-  uio[5]: ""
-  uio[6]: ""
-  uio[7]: ""
+  uio[0]: "Pmod CS0 (flash select - IMEM)"
+  uio[1]: "Pmod SD0 (MOSI, shared flash/PSRAM)"
+  uio[2]: "Pmod SD1 (MISO, shared flash/PSRAM)"
+  uio[3]: "Pmod SCK (shared flash/PSRAM)"
+  uio[4]: "Pmod SD2 (held high, unused)"
+  uio[5]: "Pmod SD3 (held high, unused)"
+  uio[6]: "Pmod CS1 (RAM A CS) "
+  uio[7]: "Pmod CS2 SPI CS (general-purpose SPI)"
 
 # Do not change!
 yaml_version: 6

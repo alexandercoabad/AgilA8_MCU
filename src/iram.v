@@ -60,6 +60,29 @@ module iram (
     reg [7:0] mem [0:127];
     reg [6:0] waddr;
 
+    // *** BUG FIX (see chat): a8_core holds dmem_valid across TWO
+    // cycles for every DMEM access (it re-asserts valid every cycle
+    // it's still waiting to observe ready, and - because dmem_ready is
+    // itself a registered, one-cycle-later response - that means valid
+    // is seen high for exactly 2 cycles per instruction, with ready
+    // only appearing on the second). That's harmless for ram32.v and
+    // a8_peripherals.v, because a plain register write is idempotent:
+    // writing the same address with the same data twice in a row
+    // leaves the same final result as writing it once. IMEM_WDATA is
+    // NOT idempotent - it auto-increments waddr as a side effect of
+    // the write - so firing on both qualifying cycles silently wrote
+    // every received byte to TWO consecutive addresses instead of one,
+    // confirmed by tracing dmem_valid/waddr/dmem_wdata directly: every
+    // byte appeared at both waddr and waddr+1 before the next byte's
+    // write began. Fixed with an edge-detect guard so the write+
+    // increment only fires on the FIRST cycle of each fresh request,
+    // not on every cycle valid happens to still be asserted - same
+    // general pattern (suppressing a stale/repeated trigger across a
+    // multi-cycle wait) as the just_finished guards already used in
+    // qspi_shared_engine.v, just for a side-effecting register instead
+    // of an SPI bus grant.
+    reg was_wdata_valid;
+
     // ---- Read port ----
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -75,11 +98,13 @@ module iram (
     // ---- Write-control port ----
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            waddr      <= 7'd0;
-            dmem_ready <= 1'b0;
-            dmem_rdata <= 8'h00;
+            waddr           <= 7'd0;
+            dmem_ready      <= 1'b0;
+            dmem_rdata      <= 8'h00;
+            was_wdata_valid <= 1'b0;
         end else begin
-            dmem_ready <= 1'b0;
+            dmem_ready      <= 1'b0;
+            was_wdata_valid <= (dmem_valid && dmem_hit && dmem_addr == ADDR_WDATA);
 
             if (dmem_valid && dmem_hit) begin
                 dmem_ready <= 1'b1;
@@ -92,7 +117,7 @@ module iram (
                     end
 
                     ADDR_WDATA: begin
-                        if (dmem_we) begin
+                        if (dmem_we && !was_wdata_valid) begin
                             mem[waddr] <= dmem_wdata;
                             waddr      <= waddr + 7'd1;
                         end

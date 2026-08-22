@@ -106,17 +106,34 @@ module tt_um_agila8 (
     // FLASH_MODE (0xF7, write-any-value-to-set, sticky until reset):
     // boot_rom's timeout fallback needs to hand control to flash, but
     // a8_core's JALR truncates its target to 8 bits ({8'h00, rs1_data
-    // + imm_sext} in a8_core.v) - it can only ever reach 0x0000-0x00FF,
-    // and JAL's PC-relative range (+-62 bytes) can't cover the gap to
-    // flash space either. So instead of trying to jump TO flash (which
-    // no instruction in this ISA can do from boot_rom's fixed location),
-    // this flag changes what memory backs address 0x0000 itself: once
-    // set, imem_addr 0x0000 and up resolve directly to flash (unrebased
-    // - flash's own byte 0 is whatever a normal, existing flash image
-    // already has at its start, unchanged), and boot_rom/iram become
-    // completely unreachable until the next reset. The bootloader's
-    // timeout path just needs SW FLASH_MODE then JALR to 0x0000 - both
-    // trivially within JALR's 8-bit reach.
+    // + imm_sext} in a8_core.v) - it can only ever reach 0x0000-0x00FF.
+    // So instead of trying to jump TO flash directly (structurally
+    // impossible from boot_rom - no instruction in this ISA can reach
+    // 0x0100+ from a fixed low address), this flag changes what
+    // 0x0080-0x00FF resolves to: normally iram's IMEM port, but flash
+    // (rebased by -0x80) once set. boot_rom (0x0000-0x007F) is ALWAYS
+    // mapped regardless of flash_mode - it has to be, since the SW +
+    // JALR sequence that sets this flag is itself stored there and
+    // must keep fetching correctly right up until the JALR actually
+    // completes. Both the successful-load path (LOAD_DONE) and the
+    // timeout path now JALR to the SAME address, 0x0080 - flash_mode
+    // only changes what that address means.
+    //
+    // *** BUG FIX: the previous version gated boot_rom_hit on
+    // !flash_mode_r too, which broke fetching the JALR instruction's
+    // own bytes the instant the preceding SW set the flag - pc just
+    // continued sequentially past the JALR instead of ever jumping,
+    // because the fetch of the JALR's own address fell through to the
+    // (at that point still-empty/wrong) flash branch. It also used an
+    // unconditional `imem_addr - 0x100` for flash_addr with no
+    // flash_mode_r awareness at all, which underflows for any
+    // imem_addr < 0x100 once flash_mode is set (e.g. imem_addr=0x0000
+    // - 0x0100 wraps to 0xFF00) - completely unrelated to what flash
+    // byte should actually be fetched. Fixed the same way this exact
+    // bug class was fixed in the shared_ram version of this design:
+    // boot_rom unconditional, single flash_addr offset (-0x80, not
+    // -0x100) with no branching, so there's no discontinuity at any
+    // boundary. ***
     //------------------------------------------------------------------
 
     reg  flash_mode_r;
@@ -129,8 +146,9 @@ module tt_um_agila8 (
             flash_mode_r <= 1'b1;
     end
 
-    wire        onchip_imem_hit = (imem_addr < 16'h0100) && !flash_mode_r;
-    wire        boot_rom_hit    = (imem_addr < 16'h0080) && !flash_mode_r;
+    wire boot_rom_hit  = (imem_addr < 16'h0080);
+    wire iram_imem_hit = (imem_addr >= 16'h0080) && (imem_addr < 16'h0100) && !flash_mode_r;
+    wire flash_imem_hit = !boot_rom_hit && !iram_imem_hit;
 
     wire [7:0]  boot_rom_rdata;
     wire        boot_rom_ready;
@@ -140,7 +158,7 @@ module tt_um_agila8 (
         .rst_n (rst_n),
 
         .addr  (imem_addr[6:0]),
-        .valid (imem_valid && onchip_imem_hit && boot_rom_hit),
+        .valid (imem_valid && boot_rom_hit),
 
         .rdata (boot_rom_rdata),
         .ready (boot_rom_ready)
@@ -157,7 +175,7 @@ module tt_um_agila8 (
         .rst_n (rst_n),
 
         .imem_addr  (imem_addr[6:0]),
-        .imem_valid (imem_valid && onchip_imem_hit && !boot_rom_hit),
+        .imem_valid (imem_valid && iram_imem_hit),
         .imem_rdata (iram_rdata),
         .imem_ready (iram_ready),
 
@@ -214,8 +232,20 @@ module tt_um_agila8 (
         .clk   (clk),
         .rst_n (rst_n),
 
-        .flash_addr           (imem_addr - 16'h0100),
-        .flash_valid          (imem_valid && !onchip_imem_hit),
+        // Single unconditional offset (-0x80), no branching on
+        // flash_mode_r or imem_addr - this is what makes addressing
+        // continuous across every boundary, including 0x0100 (where a
+        // two-branch version, one offset for 0x80-0xFF and another for
+        // 0x100+, previously caused a discontinuity: imem_addr=0xFF
+        // gave flash_addr=0x7F but imem_addr=0x100 gave flash_addr=0x00
+        // under that version - a backward jump that silently
+        // re-executed flash's own first 128 bytes for any flash-mode
+        // program longer than that). flash_imem_hit already covers
+        // BOTH the traditional 0x0100+ range and the flash_mode-
+        // redirected 0x0080-0x00FF range, so one offset correctly
+        // covers everything reachable via this branch.
+        .flash_addr           (imem_addr - 16'h0080),
+        .flash_valid          (imem_valid && flash_imem_hit),
         .flash_rdata          (flash_rdata_w),
         .flash_ready          (flash_ready_w),
         .flash_read_delay_cfg (4'd2),
@@ -246,18 +276,20 @@ module tt_um_agila8 (
 
     //------------------------------------------------------------------
     // IMEM Mux (boot_rom / iram / flash - see the on-chip IMEM block
-    // above for address ranges)
+    // above for address ranges. flash_imem_hit already covers whatever
+    // isn't boot_rom or iram, so a plain two-way ternary here is
+    // correct without special-casing flash_mode again.)
     //------------------------------------------------------------------
 
     assign imem_rdata =
-        boot_rom_hit    ? boot_rom_rdata :
-        onchip_imem_hit ? iram_rdata     :
-                           flash_rdata_w;
+        boot_rom_hit  ? boot_rom_rdata :
+        iram_imem_hit ? iram_rdata     :
+                         flash_rdata_w;
 
     assign imem_ready =
-        boot_rom_hit    ? boot_rom_ready :
-        onchip_imem_hit ? iram_ready     :
-                           flash_ready_w;
+        boot_rom_hit  ? boot_rom_ready :
+        iram_imem_hit ? iram_ready     :
+                         flash_ready_w;
 
     //------------------------------------------------------------------
     // Peripheral Block (GPIO / Timer / PWM - unaffected by the SPI merge)

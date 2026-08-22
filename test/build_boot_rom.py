@@ -20,11 +20,13 @@ IMEM_WADDR (0xF5, sets the write pointer) and IMEM_WDATA (0xF6, commits
 a byte and auto-increments the pointer).
 
 On completion, jumps to 0x0080 (IRAM base) to run the loaded program.
-On timeout (no START seen), sets FLASH_MODE (0xF7) so address 0x0000
-resolves to external flash instead of this ROM, then jumps there -
-JALR cannot reach flash space (0x0100+) directly, its target is always
-an 8-bit result zero-extended, so this indirection through FLASH_MODE
-is required, not optional - see tt_um_agila8.v's header for the full
+On timeout (no START seen), sets FLASH_MODE (0xF7) so address 0x0080
+resolves to external flash instead of iram, then jumps there too -
+boot_rom (0x00-0x7F) is always mapped regardless of flash_mode, so
+both the successful-load and timeout paths JALR to the SAME address
+(0x0080); flash_mode only changes what that address resolves to. JALR
+cannot reach flash space directly if it were still based at 0x0100+,
+since its target is always an 8-bit result zero-extended - see tt_um_agila8.v's header for the full
 reasoning, and the timeout-path comment below for a bug this fixes.
 """
 
@@ -123,27 +125,31 @@ a.ADDI(6, 0, 31)              # timeout threshold (small for test purposes -
 a.BLT(1, 6, "WAIT_START")
 # timeout expired - jump to flash fallback via FLASH_MODE (0xF7).
 #
-# *** BUG FIX (see chat): JALR's target is ALWAYS {8'h00, ...} - an
-# 8-bit result, zero-extended (confirmed in a8_core.v/a8_alu.v) - so no
-# register value can make JALR reach 0x0100 or beyond, full stop. The
-# previous version here tried `SLL r7, r7, 6` to compute 0x100 directly
-# into r7, intending to JALR straight to flash space - but a8_alu.v's
-# SLL result is declared [7:0], so 4<<6=256 silently truncates to 0.
-# r7 ended up 0x00, not 0x100, and JALR landed back at address 0x0000 -
-# boot_rom's OWN reset vector - so on timeout the chip looped back to
-# WAIT_START forever instead of ever reaching flash. Confirmed by
-# tracing the exact arithmetic in Python against a8_alu.v's actual
-# result width, not just by reading the code.
+# *** BUG FIX (see chat): two separate issues here.
 #
-# Correct fix: don't try to jump TO flash at all (structurally
-# impossible from here) - instead write FLASH_MODE (0xF7,
-# write-any-value-to-set, see tt_um_agila8.v's header) so address
-# 0x0000 itself resolves to flash instead of boot_rom, then JALR to
-# 0x0000 (trivially within JALR's 8-bit reach). This is the mechanism
-# tt_um_agila8.v already built and documented for exactly this
-# situation - it just wasn't being used here until this fix.
+# (1) JALR's target is ALWAYS {8'h00, ...} - an 8-bit result,
+# zero-extended (confirmed in a8_core.v/a8_alu.v) - so no register
+# value can make JALR reach 0x0100 or beyond, full stop. An earlier
+# version tried `SLL r7, r7, 6` to compute 0x100 directly into r7,
+# intending to JALR straight to flash space - but a8_alu.v's SLL
+# result is declared [7:0], so 4<<6=256 silently truncates to 0. r7
+# ended up 0x00, not 0x100.
+#
+# (2) The fix for (1) - writing FLASH_MODE then JALR to 0x0000 - was
+# ITSELF wrong once tt_um_agila8.v's boot_rom_hit became unconditional
+# (a separate, necessary fix: boot_rom has to stay mapped regardless
+# of flash_mode, since the SW+JALR sequence setting the flag is itself
+# stored there and needs to keep fetching correctly until the JALR
+# completes). With boot_rom unconditional, JALR to 0x0000 just re-
+# enters boot_rom's own reset vector forever, regardless of
+# flash_mode - it never reaches flash. What flash_mode actually
+# changes is what 0x0080-0x00FF resolves to (iram normally, flash once
+# set) - so this needs to JALR to 0x0080, the exact same target
+# LOAD_DONE already uses below, not 0x0000.
 a.SW(0, 0, FLASH_MODE)      # DMEM[FLASH_MODE] = r0 (0) - write-any-value-to-set
-a.JALR(0, 0, 0)              # jump to imem 0x0000, now backed by flash
+a.ADDI(7, 0, 2)
+a.SLL(7, 7, 6)                # r7 = 2 << 6 = 0x80
+a.JALR(0, 7, 0)                # jump to imem 0x0080, now backed by flash
 
 a.label("START_SEEN")
 # --- Receive length byte into r5 ---

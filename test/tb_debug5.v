@@ -57,6 +57,19 @@ module tb_debug5;
 
     // Trace every IMEM_WDATA commit (write to iram.v's mem[]) directly,
     // instead of every PC change - much more targeted for this bug.
+    //
+    // NOTE: this predates the auto-increment double-fire fix in
+    // iram.v (see that file's header). This print condition watches
+    // the raw dmem_valid/dmem_we/dmem_hit bus signals, which are still
+    // asserted for BOTH cycles a8_core holds a DMEM request - the fix
+    // only suppresses the internal mem[]/waddr side effect on the
+    // second (guarded) cycle, not these external signals. So this
+    // trace will still show two lines per received byte (with waddr
+    // differing by 1 between them, since the first line's write has
+    // already taken effect by the time the second line prints) even
+    // though only ONE real write happens now - that's expected, not a
+    // sign the bug is back. tb_bootloader.v's actual byte-by-byte
+    // comparison is the real check for that.
     integer cyc = 0;
     always @(posedge clk) begin
         cyc = cyc + 1;

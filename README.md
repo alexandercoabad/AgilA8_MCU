@@ -9,8 +9,6 @@ Agila is Tagalog for "eagle" - specifically evoking the Philippine Eagle (Haribo
 
 
 
-3D Viewer: https://gds-viewer.tinytapeout.com/?model=https://alexandercoabad.github.io/AgilA8_mcu/tinytapeout.oas&pdk=sky130A
-
 ## How it works
 
 AgilA8 is a compact 8-bit microcontroller built around A8, a custom

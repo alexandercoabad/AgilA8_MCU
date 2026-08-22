@@ -18,19 +18,55 @@ AgilA8 is a compact 8-bit microcontroller built around A8, a custom
 16-instruction CPU (see `docs/ISA.md`), with memory-mapped GPIO, a 16-bit
 timer, and PWM generation.
 
- `ram32` is a
-plain 128-byte flip-flop array (1,024 flip-flops), not a dense macro -
-this project originally moved DMEM off-chip specifically because a 1x2
-tile budget doesn't fit that (even Tiny Tapeout's own dense RAM32 hard
-macro, the same 128 bytes laid out efficiently, needs 3x2 tiles on its
-own; a plain flip-flop array is larger still). **This project now
-targets 6x2 tiles** (see `info.yaml`'s `tiles` field) specifically to
-accommodate `ram32` at this size - that's a deliberate area/cost
-tradeoff made in exchange for on-chip DMEM and an optional-for-data
-Pmod, not an oversight. Still worth confirming against the actual
-post-place-and-route cell/utilization numbers once this goes through
-`harden` again, the same way the 1x2 numbers were confirmed against the
-real GDS run before this change.
+### On-chip memory: boot ROM + ram32 + iram (three separate arrays)
+
+Two 128-byte on-chip arrays back most of address space:
+
+- **`ram32`** (DMEM 0x00-0x7F) - general-purpose scratch RAM, a plain
+  128-byte flip-flop array (1,024 flip-flops), not a dense macro.
+- **`iram`** (IMEM 0x80-0xFF) - holds a program loaded at runtime via
+  the GPIO bootloader (see below), written through two dedicated
+  registers (`IMEM_WADDR`/`IMEM_WDATA`) rather than being directly
+  addressable from the DMEM side. A second, separate 128-byte array.
+- **`boot_rom`** (IMEM 0x00-0x7F, fixed content) - always active, runs
+  the bootloader itself.
+
+This project originally moved DMEM off-chip specifically because a 1x2
+tile budget doesn't fit even one 128-byte array like this (Tiny
+Tapeout's own dense RAM32 hard macro, the same 128 bytes laid out
+efficiently, needs 3x2 tiles on its own - a plain flip-flop array is
+larger still), and **this checkpoint targets 6x2 tiles** to fit two
+such arrays plus `boot_rom`.
+
+**Known area caveat, specific to this checkpoint:** `ram32` and `iram`
+are still two fully separate arrays here, not the single merged
+`shared_ram` array used in later revisions of this project. That later
+merge isn't just a tidy-up - hardening *this* checkpoint for the Tiny
+Tapeout FPGA Development Kit (iCE40 UP5K) failed outright, with
+nextpnr reporting **5,160 of 5,280 logic cells (97%) used** and the
+placer struggling to converge at all. The two separate arrays are
+measurably more expensive than one properly merged array covering the
+same combined address range - confirmed both by this FPGA placement
+failure and by post-synthesis cell counts on the later, merged design.
+If you're choosing between checkpoints of this project rather than
+specifically working with this one, that later revision is the one to
+prefer for anything that needs to actually fit on real hardware.
+
+### Loading a program without the Pmod
+
+`boot_rom` implements a simple GPIO bit-banged protocol (`ui_in[0]`
+DATA, `ui_in[1]` CLOCK, `ui_in[2]` START) for loading a program
+directly into `iram` at runtime, with no Pmod required - see
+`test/build_boot_rom.py`'s docstring for the exact wire protocol. If no
+START is seen within a bounded timeout, `boot_rom` sets a `FLASH_MODE`
+flag (register below) and hands off to external flash instead, so an
+unattended board still boots something useful. Both the self-fetch-race
+and flash-address-discontinuity bugs that affected earlier iterations
+of this exact mechanism are fixed in this checkpoint - `boot_rom_hit`
+is unconditional on address alone, and `flash_addr` uses a single,
+continuous `-0x80` rebase - see `tt_um_agila8.v`'s comments at each
+site for the specifics, and `test/tb_flash_handoff.v` for the
+regression test covering it.
 
 A third front-end, a general-purpose SPI master intended for driving an
 external device (an LCD, an ADC, another MCU), shares the same physical
@@ -68,17 +104,20 @@ by construction, at most one of the three is ever requesting at once.
 | Address range | Device                                  |
 | -------------- | --------------------------------------- |
 | 0x00 - 0x7F    | RAM (on-chip `ram32` - see area caveat above) |
-| 0x80 - 0xEF, 0xF5 - 0xF7 | RAM (external PSRAM, RAM A) |
+| 0x80 - 0xEF    | RAM (external PSRAM, RAM A)             |
 | 0xF0 - 0xF2    | GPIO                                    |
 | 0xF3 - 0xF4    | SPI (general-purpose - requires a board mod, see below) |
+| 0xF5 - 0xF6    | IMEM write control (`iram` loader - see below) |
+| 0xF7           | FLASH_MODE (see "Loading a program" above) |
 | 0xF8 - 0xFB    | Timer                                   |
 | 0xFC - 0xFD    | PWM                                     |
 
-> **Note:** `0xF3`/`0xF4` used to be plain RAM in earlier revisions of
-> this design. They now belong to the general-purpose SPI controller
-> (see below) - any program that stored ordinary data at those two
-> addresses will now silently hit the SPI controller instead of RAM.
-> That controller only reaches an external device once the QSPI Pmod's
+> **Note:** `0xF3`-`0xF7` used to be plain RAM in earlier revisions of
+> this design. They now belong to the general-purpose SPI controller,
+> the `iram` loader, and the `FLASH_MODE` flag respectively - any
+> program that stored ordinary data at those five addresses will now
+> silently hit a peripheral register instead of RAM. That SPI
+> controller only reaches an external device once the QSPI Pmod's
 > RAM B chip-select trace has been cut (see "How it works" below) - on
 > an unmodified board, writes there are functional but only reach the
 > still-populated internal PSRAM chip, not anything external.
@@ -159,6 +198,19 @@ would otherwise appear on the shared lines mid-burst; auto-pulsing at
 least keeps CS deasserted while that happens, so the attached device
 correctly ignores it.
 
+#### IMEM loader (`iram`)
+
+| Register    | Address     | Description                                                    |
+| ----------- | ----------- | ---------------------------------------------------------------- |
+| IMEM_WADDR  | 0xF5 (W)    | Sets `iram`'s write pointer (0-127, low 7 bits used) - normally only written by `boot_rom`'s own bootload routine, not application code |
+| IMEM_WDATA  | 0xF6 (W)    | Commits the written byte to `iram[pointer]`, then auto-increments the pointer |
+
+#### FLASH_MODE
+
+| Register    | Address     | Description                                                                |
+| ----------- | ----------- | ----------------------------------------------------------------------------- |
+| FLASH_MODE  | 0xF7 (W)    | Write-any-value-to-set, no readback. Once set, IMEM 0x0080 and up resolves to external flash instead of `iram`/`boot_rom` - see "Loading a program" above. Set automatically by `boot_rom`'s own bootload timeout; not normally written by application code |
+
 #### Timer
 
 | Register    | Address     | Description                                                    |
@@ -177,24 +229,42 @@ correctly ignores it.
 
 ## How to test
 
-1. Program the test image onto the Pmod's flash chip (`test/imem.hex`,
-   built by `test/build_prog.py` - exercises every opcode plus the GPIO,
-   timer, and PWM registers) and leave the PSRAM chip's contents as-is;
-   the program initializes any RAM it depends on.
-2. Reset the design (`rst_n` low then high).
-3. Run the clock. The CPU fetches from flash and reads/writes RAM over
-   the shared SPI bus automatically - no host intervention needed once
-   running.
-4. Check final state against the golden reference model
-   (`test/golden.py`) - `test/TESTING.md` and `test/TESTING_round2.md`
-   document the expected register values, and the pipeline this was
-   last verified against.
+This checkpoint's `test/` directory has four testbenches, each covering
+a different part of the design - there's no single "run this one file"
+entry point:
+
+1. **`tb.v`** - the stock, minimal Tiny Tapeout cocotb smoke test
+   (reset plus a few generic input toggles). This is what actually
+   runs as part of the automated `gl_test` CI gate; it does not
+   exercise the bootloader, IMEM/DMEM split, or FLASH_MODE path.
+2. **`tb_bootloader.v`** - drives the real GPIO bit-banged bootload
+   protocol end to end (see "Loading a program" above), then checks
+   both the resulting `iram` contents and the loaded program's final
+   register state - the main happy-path regression for the bootloader
+   itself.
+3. **`tb_flash_handoff.v`** - the timeout path: no START is asserted,
+   so `boot_rom` times out, sets `FLASH_MODE`, and hands off to
+   external flash - checks that this lands on the correct, continuous
+   flash offset (see the area-caveat note above on why this matters -
+   this is the regression for the two bugs that used to break this
+   exact handoff in earlier checkpoints).
+4. **`tb_debug5.v`** - a lower-level trace/debug aid rather than a
+   clean pass/fail regression; useful when something above fails and
+   you need cycle-by-cycle visibility, not as a first thing to run.
+
+None of these are wired into an automated top-level "run everything"
+target in this checkpoint - run them individually with `iverilog`/`vvp`
+against the sources in `src/`.
 
 Before committing to a tapeout, the QSPI Pmod flash-read timing margin
-(`read_delay_cfg`, now handled centrally in `qspi_shared_engine.v`) is
+(`read_delay_cfg`, handled centrally in `qspi_shared_engine.v`) is
 worth validating on real hardware first, since interconnect delay isn't
-visible in behavioral simulation - see the FPGA bring-up guide for the
-Tiny Tapeout FPGA Development Kit + QSPI Pmod path used for that.
+visible in behavioral simulation. For *this specific checkpoint*,
+FPGA bring-up isn't just a nice-to-have validation step - actual
+hardening for the Tiny Tapeout FPGA Development Kit (iCE40 UP5K)
+failed, with nextpnr reporting 97% logic-cell utilization (5,160/5,280)
+and the placer unable to converge, before any timing-margin testing
+could even begin. See the area caveat under "How it works" above.
 
 ## External hardware
 

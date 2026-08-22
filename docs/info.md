@@ -14,32 +14,55 @@ AgilA8 is a compact 8-bit microcontroller built around A8, a custom
 16-instruction CPU (see `docs/ISA.md`), with memory-mapped GPIO, a 16-bit
 timer, and PWM generation.
 
-Instruction memory (all of it) and most of data memory live off-chip
-on the Tiny Tapeout QSPI Pmod. Program code is fetched from external
-SPI flash (CS0) using a standard `03h` Read Data command; the bulk of
-data memory (0x80-0xEF) lives on one of the Pmod's two PSRAM chips
-(RAM A / CS1) using standard `02h`/`03h` Write/Read commands. Only
-plain, single-line SPI commands are used for flash/PSRAM - deliberately
-not flash's continuous-read mode or PSRAM's QPI mode, both of which need
-a mode-byte/setup sequence that's easy to get subtly wrong without
-hardware to verify against.
+### On-chip memory: boot ROM + ram32 + iram (three separate arrays)
 
-The low 128 bytes of DMEM (0x00-0x7F) are on-chip instead, in `ram32`,
-making the QSPI Pmod optional for software that stays within that
-range - **flash is still required for IMEM regardless**, so the Pmod
-as a whole is not optional, only the DMEM side of it. `ram32` is a
-plain 128-byte flip-flop array (1,024 flip-flops), not a dense macro -
-this project originally moved DMEM off-chip specifically because a 1x2
-tile budget doesn't fit that (even Tiny Tapeout's own dense RAM32 hard
-macro, the same 128 bytes laid out efficiently, needs 3x2 tiles on its
-own; a plain flip-flop array is larger still). **This project now
-targets 3x2 tiles** (see `info.yaml`'s `tiles` field) specifically to
-accommodate `ram32` at this size - that's a deliberate area/cost
-tradeoff made in exchange for on-chip DMEM and an optional-for-data
-Pmod, not an oversight. Still worth confirming against the actual
-post-place-and-route cell/utilization numbers once this goes through
-`harden` again, the same way the 1x2 numbers were confirmed against the
-real GDS run before this change.
+Two 128-byte on-chip arrays back most of address space:
+
+- **`ram32`** (DMEM 0x00-0x7F) - general-purpose scratch RAM, a plain
+  128-byte flip-flop array (1,024 flip-flops), not a dense macro.
+- **`iram`** (IMEM 0x80-0xFF) - holds a program loaded at runtime via
+  the GPIO bootloader (see below), written through two dedicated
+  registers (`IMEM_WADDR`/`IMEM_WDATA`) rather than being directly
+  addressable from the DMEM side. A second, separate 128-byte array.
+- **`boot_rom`** (IMEM 0x00-0x7F, fixed content) - always active, runs
+  the bootloader itself.
+
+This project originally moved DMEM off-chip specifically because a 1x2
+tile budget doesn't fit even one 128-byte array like this (Tiny
+Tapeout's own dense RAM32 hard macro, the same 128 bytes laid out
+efficiently, needs 3x2 tiles on its own - a plain flip-flop array is
+larger still), and **this checkpoint targets 6x2 tiles** to fit two
+such arrays plus `boot_rom`.
+
+**Known area caveat, specific to this checkpoint:** `ram32` and `iram`
+are still two fully separate arrays here, not the single merged
+`shared_ram` array used in later revisions of this project. That later
+merge isn't just a tidy-up - hardening *this* checkpoint for the Tiny
+Tapeout FPGA Development Kit (iCE40 UP5K) failed outright, with
+nextpnr reporting **5,160 of 5,280 logic cells (97%) used** and the
+placer struggling to converge at all. The two separate arrays are
+measurably more expensive than one properly merged array covering the
+same combined address range - confirmed both by this FPGA placement
+failure and by post-synthesis cell counts on the later, merged design.
+If you're choosing between checkpoints of this project rather than
+specifically working with this one, that later revision is the one to
+prefer for anything that needs to actually fit on real hardware.
+
+### Loading a program without the Pmod
+
+`boot_rom` implements a simple GPIO bit-banged protocol (`ui_in[0]`
+DATA, `ui_in[1]` CLOCK, `ui_in[2]` START) for loading a program
+directly into `iram` at runtime, with no Pmod required - see
+`test/build_boot_rom.py`'s docstring for the exact wire protocol. If no
+START is seen within a bounded timeout, `boot_rom` sets a `FLASH_MODE`
+flag (register below) and hands off to external flash instead, so an
+unattended board still boots something useful. Both the self-fetch-race
+and flash-address-discontinuity bugs that affected earlier iterations
+of this exact mechanism are fixed in this checkpoint - `boot_rom_hit`
+is unconditional on address alone, and `flash_addr` uses a single,
+continuous `-0x80` rebase - see `tt_um_agila8.v`'s comments at each
+site for the specifics, and `test/tb_flash_handoff.v` for the
+regression test covering it.
 
 A third front-end, a general-purpose SPI master intended for driving an
 external device (an LCD, an ADC, another MCU), shares the same physical
@@ -77,17 +100,20 @@ by construction, at most one of the three is ever requesting at once.
 | Address range | Device                                  |
 | -------------- | --------------------------------------- |
 | 0x00 - 0x7F    | RAM (on-chip `ram32` - see area caveat above) |
-| 0x80 - 0xEF, 0xF5 - 0xF7 | RAM (external PSRAM, RAM A) |
+| 0x80 - 0xEF    | RAM (external PSRAM, RAM A)             |
 | 0xF0 - 0xF2    | GPIO                                    |
 | 0xF3 - 0xF4    | SPI (general-purpose - requires a board mod, see below) |
+| 0xF5 - 0xF6    | IMEM write control (`iram` loader - see below) |
+| 0xF7           | FLASH_MODE (see "Loading a program" above) |
 | 0xF8 - 0xFB    | Timer                                   |
 | 0xFC - 0xFD    | PWM                                     |
 
-> **Note:** `0xF3`/`0xF4` used to be plain RAM in earlier revisions of
-> this design. They now belong to the general-purpose SPI controller
-> (see below) - any program that stored ordinary data at those two
-> addresses will now silently hit the SPI controller instead of RAM.
-> That controller only reaches an external device once the QSPI Pmod's
+> **Note:** `0xF3`-`0xF7` used to be plain RAM in earlier revisions of
+> this design. They now belong to the general-purpose SPI controller,
+> the `iram` loader, and the `FLASH_MODE` flag respectively - any
+> program that stored ordinary data at those five addresses will now
+> silently hit a peripheral register instead of RAM. That SPI
+> controller only reaches an external device once the QSPI Pmod's
 > RAM B chip-select trace has been cut (see "How it works" below) - on
 > an unmodified board, writes there are functional but only reach the
 > still-populated internal PSRAM chip, not anything external.
@@ -168,6 +194,19 @@ would otherwise appear on the shared lines mid-burst; auto-pulsing at
 least keeps CS deasserted while that happens, so the attached device
 correctly ignores it.
 
+#### IMEM loader (`iram`)
+
+| Register    | Address     | Description                                                    |
+| ----------- | ----------- | ---------------------------------------------------------------- |
+| IMEM_WADDR  | 0xF5 (W)    | Sets `iram`'s write pointer (0-127, low 7 bits used) - normally only written by `boot_rom`'s own bootload routine, not application code |
+| IMEM_WDATA  | 0xF6 (W)    | Commits the written byte to `iram[pointer]`, then auto-increments the pointer |
+
+#### FLASH_MODE
+
+| Register    | Address     | Description                                                                |
+| ----------- | ----------- | ----------------------------------------------------------------------------- |
+| FLASH_MODE  | 0xF7 (W)    | Write-any-value-to-set, no readback. Once set, IMEM 0x0080 and up resolves to external flash instead of `iram`/`boot_rom` - see "Loading a program" above. Set automatically by `boot_rom`'s own bootload timeout; not normally written by application code |
+
 #### Timer
 
 | Register    | Address     | Description                                                    |
@@ -186,24 +225,42 @@ correctly ignores it.
 
 ## How to test
 
-1. Program the test image onto the Pmod's flash chip (`test/imem.hex`,
-   built by `test/build_prog.py` - exercises every opcode plus the GPIO,
-   timer, and PWM registers) and leave the PSRAM chip's contents as-is;
-   the program initializes any RAM it depends on.
-2. Reset the design (`rst_n` low then high).
-3. Run the clock. The CPU fetches from flash and reads/writes RAM over
-   the shared SPI bus automatically - no host intervention needed once
-   running.
-4. Check final state against the golden reference model
-   (`test/golden.py`) - `test/TESTING.md` and `test/TESTING_round2.md`
-   document the expected register values, and the pipeline this was
-   last verified against.
+This checkpoint's `test/` directory has four testbenches, each covering
+a different part of the design - there's no single "run this one file"
+entry point:
+
+1. **`tb.v`** - the stock, minimal Tiny Tapeout cocotb smoke test
+   (reset plus a few generic input toggles). This is what actually
+   runs as part of the automated `gl_test` CI gate; it does not
+   exercise the bootloader, IMEM/DMEM split, or FLASH_MODE path.
+2. **`tb_bootloader.v`** - drives the real GPIO bit-banged bootload
+   protocol end to end (see "Loading a program" above), then checks
+   both the resulting `iram` contents and the loaded program's final
+   register state - the main happy-path regression for the bootloader
+   itself.
+3. **`tb_flash_handoff.v`** - the timeout path: no START is asserted,
+   so `boot_rom` times out, sets `FLASH_MODE`, and hands off to
+   external flash - checks that this lands on the correct, continuous
+   flash offset (see the area-caveat note above on why this matters -
+   this is the regression for the two bugs that used to break this
+   exact handoff in earlier checkpoints).
+4. **`tb_debug5.v`** - a lower-level trace/debug aid rather than a
+   clean pass/fail regression; useful when something above fails and
+   you need cycle-by-cycle visibility, not as a first thing to run.
+
+None of these are wired into an automated top-level "run everything"
+target in this checkpoint - run them individually with `iverilog`/`vvp`
+against the sources in `src/`.
 
 Before committing to a tapeout, the QSPI Pmod flash-read timing margin
-(`read_delay_cfg`, now handled centrally in `qspi_shared_engine.v`) is
+(`read_delay_cfg`, handled centrally in `qspi_shared_engine.v`) is
 worth validating on real hardware first, since interconnect delay isn't
-visible in behavioral simulation - see the FPGA bring-up guide for the
-Tiny Tapeout FPGA Development Kit + QSPI Pmod path used for that.
+visible in behavioral simulation. For *this specific checkpoint*,
+FPGA bring-up isn't just a nice-to-have validation step - actual
+hardening for the Tiny Tapeout FPGA Development Kit (iCE40 UP5K)
+failed, with nextpnr reporting 97% logic-cell utilization (5,160/5,280)
+and the placer unable to converge, before any timing-margin testing
+could even begin. See the area caveat under "How it works" above.
 
 ## External hardware
 
@@ -224,3 +281,154 @@ Tiny Tapeout FPGA Development Kit + QSPI Pmod path used for that.
 - Tiny Tapeout demoboard, or the
   [FPGA Development Kit](https://store.tinytapeout.com/products/FPGA-Development-Kit-p813805747)
   for pre-tapeout bring-up on real silicon-adjacent hardware.
+
+
+# Acknowledgments & Attribution
+
+This file documents the open-source tools, process design kit, and prior
+art that AbadMCU depends on or was inspired by. It's split into two
+categories that are easy to conflate but legally distinct:
+
+1. **Tools and IP actually incorporated into this design** - their
+   licenses (all Apache-2.0) place real obligations on redistribution.
+2. **Architectural inspiration from prior projects** - no code was
+   copied from these; crediting them is good academic/community
+   practice, not a license requirement, since taking inspiration from
+   a *design pattern* (as opposed to copying source text) isn't a
+   Copyright event.
+
+---
+
+## 1. Tools & IP incorporated into this design (Apache-2.0)
+
+The physical chip (GDS) produced from this repository directly embeds
+standard-cell layouts from, and was built using, the following
+Apache-2.0-licensed projects. Their copyright notices are reproduced
+below per Apache-2.0 \u00a74; none of them ship a separate `NOTICE` file as
+of this writing (checked: skywater-pdk's repository root contains only
+`LICENSE` and `AUTHORS`, no `NOTICE` - worth re-checking the others
+listed here yourself before a formal release, since this wasn't
+exhaustively verified for every entry.
+
+### SkyWater SKY130 PDK
+The standard-cell library design was synthesized and hardened
+against.
+
+```
+Copyright 2020 SkyWater PDK Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+```
+Source: https://github.com/google/skywater-pdk
+
+### open_pdks
+PDK build/installer tooling used to assemble the sky130 PDK for the
+hardening flow.
+
+Source: https://github.com/fossi-foundation/open-pdks (Apache-2.0)
+
+### OpenLane / OpenROAD
+The RTL-to-GDS tool flow (synthesis, place & route, STA, DRC/LVS) that
+produced this design's GDS.
+
+```
+OpenLane is \u00a92020-2024 Efabless Corporation and is available under
+the Apache License, version 2.0.
+```
+Source: https://github.com/The-OpenROAD-Project/OpenLane
+
+If citing academically:
+> M. Shalan and T. Edwards, "Building OpenLANE: A 130nm OpenROAD-based
+> Tapeout-Proven Flow," 2020 IEEE/ACM International Conference on
+> Computer-Aided Design (ICCAD), San Diego, CA, USA, 2020, pp. 1-6.
+
+### Tiny Tapeout project templates / tt-support-tools
+The `tt_um_*` port convention, `info.yaml` schema, and CI/build
+scaffolding this repo's structure follows.
+
+Source: https://github.com/TinyTapeout (templates are Apache-2.0 by
+default per Tiny Tapeout's own FAQ)
+
+---
+
+## 2. Architectural inspiration (no code reused)
+
+AgilA8's central design decision - CPU with no on-chip memory,
+program fetched from external QSPI flash, working data in external
+QSPI PSRAM, sharing physical SPI wires between them via a separate chip
+selects - follows the same strategic pattern pioneered on Tiny Tapeout
+by the following projects. **No RTL, ISA encoding, or source code from
+either project was copied** - AgilA8's CPU core, instruction set, and
+peripheral RTL were independently designed and implemented. What's
+credited here is the *architectural pattern*, not any specific
+implementation of it.
+
+### TinyQV (Michael Bell)
+First (and to date, most complete) demonstration of this
+flash+PSRAM-over-shared-QSPI-Pmod pattern on Tiny Tapeout, including
+the specific convention of a single active chip-select and
+code-execution-restricted-to-flash.
+
+Source: https://github.com/MichaelBell/tinyQV (Apache-2.0)
+
+### KianV (Hirosh Dabui / splinedrive)
+Independent, earlier demonstration of the same external-memory-over-QSPI
+pattern (both the uLinux and bare-metal editions), predating this
+project.
+
+Source: https://github.com/splinedrive/kianRiscV,
+https://github.com/TinyTapeout/KianV-RV32IMA-RISC-V-uLinux-SoC
+(check the repository's own LICENSE file directly before citing a
+specific license - it wasn't confirmed via an explicit license badge
+at the time this was written)
+
+### RISC-V (conceptual influence only)
+A8's `r0`-hardwired-to-zero convention and load/store architectural
+style are modeled on RISC-V's design philosophy. RISC-V is an open,
+freely usable ISA specification; no code is reused here, so this
+carries no license obligation. **TT8 is not RISC-V-compliant** - it's
+a custom 16-bit-instruction, 8-bit-datapath ISA in the RISC-V style,
+and should not be described as a RISC-V implementation or use the
+RISC-V trademark/logo.
+
+---
+
+## 3. What's original to this project
+
+- The A8 instruction encoding (16-bit fixed-width, R-type/I-type
+  split, the specific opcode table) is a custom design, not derived
+  from any existing ISA's bit layout.
+- All RTL in this repository (`a8_core.v`, `a8_alu.v`,
+  `a8_regfile.v`, `a8_peripherals.v`, `qspi_shared_engine.v`,
+  `spi_ctrl.v`, `tt_um_agila8.v`) was independently written for
+  this project. `qspi_shared_engine.v` consolidates what were
+  previously three separate controllers (`qspi_flash_reader.v` for
+  flash, `qspi_psram_ctrl.v` for PSRAM, and `spi_ctrl.v` for the
+  general-purpose SPI peripheral) into one shared engine - see that
+  file's header for why, and `spi_ctrl.v`'s own header/testbench for
+  the general-purpose SPI register semantics it still documents even
+  though it isn't the module instantiated in the final design.
+- The verification suite, bug fixes, and STA signoff analysis
+  documented in this repository's history are this project's own work.
+
+---
+
+## Unverified claims to double-check before formal publication
+
+- A code comment (originally in `qspi_flash_reader.v`, which may or may
+  not still be present in the repo as reference material - it isn't
+  part of the module actually instantiated after the merge) attributes
+  a ~20ns round-trip timing margin figure to "TinyQV's own QSPI
+  controller comments." This has not been independently confirmed
+  against TinyQV's actual source - verify both the exact figure/its
+  origin, and which file it currently lives in, before citing it as a
+  TinyQV-derived fact.
+- The Apache-2.0 NOTICE-file check above was only performed for
+  skywater-pdk; confirm the other three Apache-2.0 entries (open_pdks,
+  OpenLane, Tiny Tapeout templates) don't ship their own NOTICE files
+  before finalizing this document, since if any of them do, its
+  contents would need to be reproduced here per \u00a74(d).
+
